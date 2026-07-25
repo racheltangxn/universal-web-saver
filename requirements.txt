@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+apify-client
+google-genai
+notion-client
+requests
+trafilatura
+youtube-transcript-api
+python-dotenv
