@@ -1,9 +1,8 @@
 fastapi
 uvicorn[standard]
-apify-client
+apify-client==3.1.0
 google-genai
 notion-client
 requests
 trafilatura
-youtube-transcript-api
 python-dotenv

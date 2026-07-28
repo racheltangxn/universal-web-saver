@@ -23,7 +23,6 @@ Run:
 import hmac
 import logging
 import os
-import re
 from datetime import date, datetime
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -37,8 +36,6 @@ from fastapi.concurrency import run_in_threadpool
 from google import genai
 from google.genai import types as genai_types
 from notion_client import Client as NotionClient
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
 
 # --------------------------------------------------------------------------- #
 # Setup
@@ -63,6 +60,11 @@ NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
 APIFY_INSTAGRAM_ACTOR = os.environ.get("APIFY_INSTAGRAM_ACTOR", "apify/instagram-scraper")
 APIFY_TIKTOK_ACTOR = os.environ.get("APIFY_TIKTOK_ACTOR", "clockworks/tiktok-scraper")
 APIFY_LINKEDIN_ACTOR = os.environ.get("APIFY_LINKEDIN_ACTOR", "apify/linkedin-post-scraper")
+# youtube-transcript-api's direct calls get blocked from cloud-provider IPs
+# (Cloud Run included), so YouTube is routed through Apify like the other
+# platforms instead. starvibe/youtube-video-transcript picked for its 99.99%
+# success rate across ~490k runs at evaluation time (2026-07-28).
+APIFY_YOUTUBE_ACTOR = os.environ.get("APIFY_YOUTUBE_ACTOR", "starvibe/youtube-video-transcript")
 
 JINA_READER_BASE = "https://r.jina.ai/"
 # "gemini-1.5-flash" was the original spec's model; that line (and even 2.5-flash)
@@ -97,53 +99,29 @@ def classify_url(url: str) -> str:
     return "general"
 
 
-def extract_youtube_video_id(url: str) -> Optional[str]:
-    parsed = urlparse(url)
-    if "youtu.be" in parsed.netloc:
-        return parsed.path.lstrip("/")
-    if "youtube.com" in parsed.netloc:
-        if parsed.path == "/watch":
-            match = re.search(r"[?&]v=([^&]+)", url)
-            return match.group(1) if match else None
-        if parsed.path.startswith("/shorts/"):
-            return parsed.path.split("/shorts/")[1].split("/")[0]
-    return None
-
-
 def extract_youtube(url: str) -> dict[str, Any]:
-    """Fetch transcript + title for a YouTube video. No images/video download."""
-    video_id = extract_youtube_video_id(url)
-    if not video_id:
-        raise ValueError(f"Could not parse YouTube video ID from {url}")
+    """Fetch transcript + title/channel for a YouTube video via Apify (direct
+    youtube-transcript-api calls get blocked from cloud-provider IPs). No
+    images/video download."""
+    log.info("YouTube: running Apify actor %s for %s", APIFY_YOUTUBE_ACTOR, url)
+    run = apify_client.actor(APIFY_YOUTUBE_ACTOR).call(
+        run_input={"youtube_url": url, "include_transcript_text": True}
+    )
+    if run is None:
+        raise ValueError(f"Apify actor {APIFY_YOUTUBE_ACTOR} run failed to start for {url}")
 
-    log.info("YouTube: fetching transcript for video_id=%s", video_id)
-    try:
-        transcript_list = YouTubeTranscriptApi().fetch(video_id, languages=["en", "en-US", "en-GB"])
-        transcript_text = " ".join(snippet.text for snippet in transcript_list)
-    except (TranscriptsDisabled, NoTranscriptFound) as e:
-        log.warning("YouTube: no English transcript available (%s)", e)
-        transcript_text = ""
+    items = list(apify_client.dataset(run.default_dataset_id).iterate_items())
+    if not items:
+        raise ValueError(f"Apify actor {APIFY_YOUTUBE_ACTOR} returned no items for {url}")
 
-    # Lightweight title fetch via oEmbed — no API key required.
-    title = url
-    try:
-        oembed = requests.get(
-            "https://www.youtube.com/oembed",
-            params={"url": url, "format": "json"},
-            timeout=10,
-        )
-        oembed.raise_for_status()
-        data = oembed.json()
-        title = data.get("title", url)
-        author_name = data.get("author_name")
-    except requests.RequestException as e:
-        log.warning("YouTube: oEmbed title fetch failed (%s)", e)
-        author_name = None
+    item = items[0]
+    if item.get("status") != "success":
+        log.warning("YouTube: actor reported non-success status for %s (%s)", url, item.get("message"))
 
     return {
-        "text": transcript_text,
-        "title": title,
-        "author_name": author_name,
+        "text": item.get("transcript_text") or "",
+        "title": item.get("title") or url,
+        "author_name": item.get("channel_name"),
         "images": [],
     }
 
@@ -161,7 +139,10 @@ def extract_social(url: str, platform: str) -> dict[str, Any]:
 
     run_input = {"directUrls": [url], "urls": [url], "postUrls": [url]}
     run = apify_client.actor(actor_id).call(run_input=run_input)
-    items = list(apify_client.dataset(run["defaultDatasetId"]).iterate_items())
+    if run is None:
+        raise ValueError(f"Apify actor {actor_id} run failed to start for {url}")
+    # apify-client 3.x returns a typed Run model (snake_case attrs), not a dict.
+    items = list(apify_client.dataset(run.default_dataset_id).iterate_items())
 
     if not items:
         raise ValueError(f"Apify actor {actor_id} returned no items for {url}")
