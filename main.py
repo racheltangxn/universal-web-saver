@@ -346,9 +346,27 @@ SOURCE_TYPE_MAP = {
 }
 
 
+def find_existing_page(url: str) -> Optional[str]:
+    """Return the page ID already saved for this URL, if any. Guards against
+    duplicate pages when a client (e.g. a timed-out HTTP Shortcuts request)
+    retries the same webhook call."""
+    results = notion.databases.query(
+        database_id=NOTION_DATABASE_ID,
+        filter={"property": "External ID", "rich_text": {"equals": url[:2000]}},
+        page_size=1,
+    )
+    pages = results.get("results") or []
+    return pages[0]["id"] if pages else None
+
+
 def push_to_notion(url: str, platform: str, title: str, ai_data: dict[str, Any]) -> str:
     """Create a Notion page with mapped properties + transcription page content.
-    Returns the new page ID."""
+    Returns the new (or existing, if already saved) page ID."""
+    existing_id = find_existing_page(url)
+    if existing_id:
+        log.info("Notion: %s already saved as page %s, skipping duplicate create", url, existing_id)
+        return existing_id
+
     properties = {
         "Title": {"title": [{"text": {"content": title[:2000] or url}}]},
         "URL": {"url": url},
