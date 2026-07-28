@@ -3,11 +3,18 @@ Universal Web Saver — webhook backend for the "Save to Notion" Android Share S
 
 Pipeline:
   1. Android (HTTP Shortcuts) POSTs a URL to /webhook with an X-API-Key header.
-  2. We validate the key, kick off a BackgroundTask, and return 200 immediately.
-  3. The background task routes the URL by domain (Instagram/TikTok/LinkedIn via
+  2. We validate the key, then run the pipeline synchronously (offloaded to a
+     threadpool so the event loop isn't blocked) and return the real result.
+  3. The pipeline routes the URL by domain (Instagram/TikTok/LinkedIn via
      Apify, YouTube via transcript API, everything else via Jina Reader /
      trafilatura), sends the extracted content to Gemini for structured tagging,
      and pushes the result into a Notion database page.
+
+Synchronous by design: on Cloud Run (scale-to-zero), CPU isn't guaranteed once
+a response has been sent, so a "return 200 immediately, finish in the
+background" pattern can get silently killed mid-pipeline. Waiting for the real
+result (~10-30s) trades instant-ack UX for actually knowing whether the save
+worked.
 
 Run:
     uvicorn main:app --host 0.0.0.0 --port 8000
@@ -25,7 +32,8 @@ import requests
 import trafilatura
 from apify_client import ApifyClient
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from google import genai
 from google.genai import types as genai_types
 from notion_client import Client as NotionClient
@@ -404,30 +412,32 @@ def push_to_notion(url: str, platform: str, title: str, ai_data: dict[str, Any])
 # The async pipeline
 # --------------------------------------------------------------------------- #
 
-def process_url(url: str) -> None:
-    """Full extraction -> Gemini -> Notion pipeline. Runs in the background;
-    all exceptions are caught and logged so the request/response cycle is
-    never affected."""
+def process_url(url: str) -> dict[str, Any]:
+    """Full extraction -> Gemini -> Notion pipeline. Each stage's exception is
+    caught and logged, then turned into a real {"ok": False, "error": ...}
+    result instead of being swallowed, so the caller can report what actually
+    happened."""
     log.info("=== Processing %s ===", url)
     try:
         platform, extracted = route_and_extract(url)
-    except Exception:
+    except Exception as e:
         log.exception("Extraction failed for %s", url)
-        return
+        return {"ok": False, "error": f"Extraction failed: {e}"}
 
     try:
         ai_data = call_gemini(url, extracted)
-    except Exception:
+    except Exception as e:
         log.exception("Gemini tagging failed for %s", url)
-        return
+        return {"ok": False, "error": f"Gemini tagging failed: {e}"}
 
     try:
-        push_to_notion(url, platform, extracted.get("title") or url, ai_data)
-    except Exception:
+        page_id = push_to_notion(url, platform, extracted.get("title") or url, ai_data)
+    except Exception as e:
         log.exception("Notion push failed for %s", url)
-        return
+        return {"ok": False, "error": f"Notion push failed: {e}"}
 
     log.info("=== Done: %s ===", url)
+    return {"ok": True, "title": extracted.get("title") or url, "notion_page_id": page_id}
 
 
 # --------------------------------------------------------------------------- #
@@ -437,7 +447,6 @@ def process_url(url: str) -> None:
 @app.post("/webhook")
 async def webhook(
     request: Request,
-    background_tasks: BackgroundTasks,
     x_api_key: Optional[str] = Header(default=None),
 ):
     if not x_api_key or not hmac.compare_digest(x_api_key, SECRET_WEBHOOK_KEY):
@@ -454,8 +463,12 @@ async def webhook(
         raise HTTPException(status_code=400, detail="Missing 'url' field in payload")
 
     log.info("Accepted webhook for %s", url)
-    background_tasks.add_task(process_url, url)
-    return {"status": "Processing web content"}
+    # process_url does blocking I/O (requests/apify_client/notion_client are all
+    # sync); offload to a threadpool so the event loop can still serve /health etc.
+    result = await run_in_threadpool(process_url, url)
+    if not result["ok"]:
+        raise HTTPException(status_code=502, detail=result["error"])
+    return {"status": "saved", "title": result["title"], "notion_page_id": result["notion_page_id"]}
 
 
 @app.get("/health")
