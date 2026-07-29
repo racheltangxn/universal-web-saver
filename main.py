@@ -346,12 +346,30 @@ SOURCE_TYPE_MAP = {
 }
 
 
+_data_source_id: Optional[str] = None
+
+
+def get_data_source_id() -> str:
+    """notion-client 3.x split database queries into a separate 'data source'
+    concept (Notion API 2025-09-03+): databases.query() no longer exists,
+    queries go through data_sources.query() against the data source id, not
+    the database id. Resolved once and cached."""
+    global _data_source_id
+    if _data_source_id is None:
+        db = notion.databases.retrieve(database_id=NOTION_DATABASE_ID)
+        data_sources = db.get("data_sources") or []
+        if not data_sources:
+            raise ValueError(f"Notion database {NOTION_DATABASE_ID} has no data sources")
+        _data_source_id = data_sources[0]["id"]
+    return _data_source_id
+
+
 def find_existing_page(url: str) -> Optional[str]:
     """Return the page ID already saved for this URL, if any. Guards against
     duplicate pages when a client (e.g. a timed-out HTTP Shortcuts request)
     retries the same webhook call."""
-    results = notion.databases.query(
-        database_id=NOTION_DATABASE_ID,
+    results = notion.data_sources.query(
+        data_source_id=get_data_source_id(),
         filter={"property": "External ID", "rich_text": {"equals": url[:2000]}},
         page_size=1,
     )
