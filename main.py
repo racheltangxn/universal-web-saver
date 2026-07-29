@@ -23,6 +23,8 @@ Run:
 import hmac
 import logging
 import os
+import tempfile
+import time
 from datetime import date, datetime
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -101,8 +103,10 @@ def classify_url(url: str) -> str:
 
 def extract_youtube(url: str) -> dict[str, Any]:
     """Fetch transcript + title/channel for a YouTube video via Apify (direct
-    youtube-transcript-api calls get blocked from cloud-provider IPs). No
-    images/video download."""
+    youtube-transcript-api calls get blocked from cloud-provider IPs), and
+    also hand the URL to Gemini directly as a video (video_uri) — Gemini
+    fetches YouTube URLs natively, so it can watch/listen to the actual video
+    (on-screen text, visuals) instead of relying only on the caption track."""
     log.info("YouTube: running Apify actor %s for %s", APIFY_YOUTUBE_ACTOR, url)
     run = apify_client.actor(APIFY_YOUTUBE_ACTOR).call(
         run_input={"youtube_url": url, "include_transcript_text": True}
@@ -123,6 +127,7 @@ def extract_youtube(url: str) -> dict[str, Any]:
         "title": item.get("title") or url,
         "author_name": item.get("channel_name"),
         "images": [],
+        "video_uri": url,
     }
 
 
@@ -157,14 +162,19 @@ def extract_social(url: str, platform: str) -> dict[str, Any]:
         or item.get("author", {}).get("username")
         or item.get("authorName")
     )
+    # Video posts (Reels/TikTok/LinkedIn video) get a `videoUrl` — keep that
+    # separate from still images so it's uploaded to Gemini as an actual video
+    # (audio + motion + on-screen text) instead of being treated as a photo.
+    video_url = item.get("videoUrl")
+
     images = []
     if item.get("displayUrl"):
         images.append(item["displayUrl"])
-    if item.get("videoUrl"):
-        images.append(item["videoUrl"])
     if item.get("images"):
         images.extend(item["images"])
-    if item.get("coverUrl"):
+    if not video_url and item.get("coverUrl"):
+        # Cover thumbnail is only useful as a fallback when there's no actual
+        # video to analyze (e.g. actor failed to return a video URL).
         images.append(item["coverUrl"])
 
     title = caption[:120] if caption else f"{platform.title()} post by {handle or 'unknown'}"
@@ -174,6 +184,7 @@ def extract_social(url: str, platform: str) -> dict[str, Any]:
         "title": title,
         "author_name": handle,
         "images": [img for img in images if img],
+        "video_url": video_url,
     }
 
 
@@ -230,11 +241,11 @@ CATEGORY_OPTIONS = [
 ]
 
 TAGGING_PROMPT = """You are a universal tagging engine for a personal "MyMind"-style
-knowledge base. You will be given the extracted text (and possibly images) from a
-saved web link. Analyze it and return STRICT JSON matching this schema:
+knowledge base. You will be given the extracted text, and possibly images or a video,
+from a saved web link. Analyze it and return STRICT JSON matching this schema:
 
 {{
-  "transcription": "The verbatim OCR text, spoken words, or the full article body text",
+  "transcription": "The full verbatim content. For a video: the spoken-word audio transcript AND any on-screen/overlay/caption text, each clearly labeled (e.g. 'Spoken:' / 'On-screen text:'). For images: OCR'd text. For articles: the full body text.",
   "ai_summary": "A 2-sentence summary of the link's core value or main thesis",
   "category": "Exactly one of: {category_options}",
   "tags": ["Tag1", "Tag2", "Tag3"],
@@ -259,8 +270,59 @@ def normalize_category(raw_category: str) -> str:
     return lookup.get((raw_category or "").strip().lower(), "Other")
 
 
+GEMINI_FILE_POLL_INTERVAL_S = 2
+GEMINI_FILE_POLL_TIMEOUT_S = 90
+
+
+def build_video_part(extracted: dict[str, Any]) -> tuple[Optional[Any], Optional[str]]:
+    """Return (Part, gemini_file_name_to_clean_up_or_None) for a video, so Gemini
+    can watch/listen to it (audio transcript + on-screen text) instead of just
+    getting a caption/cover-thumbnail proxy for it.
+
+    - YouTube: Gemini fetches youtube.com/watch?v=... URLs natively, no download needed.
+    - IG/TikTok/LinkedIn: the actor's `videoUrl` is a plain CDN link Gemini can't
+      fetch itself, so we download it and upload it through the Gemini File API.
+    """
+    youtube_uri = extracted.get("video_uri")
+    if youtube_uri:
+        return genai_types.Part.from_uri(file_uri=youtube_uri, mime_type="video/*"), None
+
+    video_url = extracted.get("video_url")
+    if not video_url:
+        return None, None
+
+    tmp_path = None
+    try:
+        log.info("Gemini: downloading video for upload: %s", video_url)
+        resp = requests.get(video_url, timeout=60, stream=True)
+        resp.raise_for_status()
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            for chunk in resp.iter_content(chunk_size=1 << 20):
+                f.write(chunk)
+            tmp_path = f.name
+
+        file_obj = gemini_client.files.upload(file=tmp_path)
+        waited = 0
+        while file_obj.state.name == "PROCESSING" and waited < GEMINI_FILE_POLL_TIMEOUT_S:
+            time.sleep(GEMINI_FILE_POLL_INTERVAL_S)
+            waited += GEMINI_FILE_POLL_INTERVAL_S
+            file_obj = gemini_client.files.get(name=file_obj.name)
+
+        if file_obj.state.name != "ACTIVE":
+            log.warning("Gemini: video upload never became ACTIVE (state=%s) for %s", file_obj.state, video_url)
+            return None, None
+
+        return genai_types.Part.from_uri(file_uri=file_obj.uri, mime_type=file_obj.mime_type), file_obj.name
+    except (requests.RequestException, OSError) as e:
+        log.warning("Gemini: could not download/upload video %s (%s)", video_url, e)
+        return None, None
+    finally:
+        if tmp_path:
+            os.unlink(tmp_path)
+
+
 def call_gemini(url: str, extracted: dict[str, Any]) -> dict[str, Any]:
-    """Send extracted text (and optional images) to Gemini and get back
+    """Send extracted text (and optional images/video) to Gemini and get back
     structured JSON tags."""
     prompt = TAGGING_PROMPT.format(
         url=url,
@@ -271,7 +333,11 @@ def call_gemini(url: str, extracted: dict[str, Any]) -> dict[str, Any]:
 
     parts: list[Any] = [prompt]
 
-    # For IG/TikTok posts, pull in a couple of images for vision context.
+    video_part, gemini_file_to_cleanup = build_video_part(extracted)
+    if video_part:
+        parts.append(video_part)
+
+    # Still images (photo posts/carousels, or a cover thumbnail fallback).
     for image_url in (extracted.get("images") or [])[:3]:
         try:
             img_resp = requests.get(image_url, timeout=15)
@@ -285,13 +351,20 @@ def call_gemini(url: str, extracted: dict[str, Any]) -> dict[str, Any]:
             log.warning("Gemini: could not download media %s (%s)", image_url, e)
 
     log.info("Gemini: sending %d part(s) for analysis", len(parts))
-    response = gemini_client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=parts,
-        config=genai_types.GenerateContentConfig(
-            response_mime_type="application/json",
-        ),
-    )
+    try:
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=parts,
+            config=genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+            ),
+        )
+    finally:
+        if gemini_file_to_cleanup:
+            try:
+                gemini_client.files.delete(name=gemini_file_to_cleanup)
+            except Exception as e:
+                log.warning("Gemini: could not clean up uploaded file %s (%s)", gemini_file_to_cleanup, e)
 
     import json
 
