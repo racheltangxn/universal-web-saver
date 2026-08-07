@@ -61,7 +61,7 @@ NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
 # Apify actor IDs — override in .env if you use different actors.
 APIFY_INSTAGRAM_ACTOR = os.environ.get("APIFY_INSTAGRAM_ACTOR", "apify/instagram-scraper")
 APIFY_TIKTOK_ACTOR = os.environ.get("APIFY_TIKTOK_ACTOR", "clockworks/tiktok-scraper")
-APIFY_LINKEDIN_ACTOR = os.environ.get("APIFY_LINKEDIN_ACTOR", "apify/linkedin-post-scraper")
+APIFY_LINKEDIN_ACTOR = os.environ.get("APIFY_LINKEDIN_ACTOR", "supreme_coder/linkedin-post")
 # youtube-transcript-api's direct calls get blocked from cloud-provider IPs
 # (Cloud Run included), so YouTube is routed through Apify like the other
 # platforms instead. starvibe/youtube-video-transcript picked for its 99.99%
@@ -131,6 +131,22 @@ def extract_youtube(url: str) -> dict[str, Any]:
     }
 
 
+def extract_linkedin_video_url(item: dict[str, Any]) -> Optional[str]:
+    """supreme_coder/linkedin-post nests the real downloadable video URL under
+    linkedinVideo.videoPlayMetadata.progressiveStreams[N].streamingLocations[0].url
+    — confirmed against a real live LinkedIn video post (2026-08-07). It's a
+    signed but directly-downloadable LinkedIn CDN link, same as Instagram/TikTok's
+    own CDN links — no auth wrapper needed."""
+    streams = (item.get("linkedinVideo") or {}).get("videoPlayMetadata", {}).get(
+        "progressiveStreams"
+    ) or []
+    if streams:
+        locations = streams[0].get("streamingLocations") or []
+        if locations:
+            return locations[0].get("url")
+    return None
+
+
 def extract_social(url: str, platform: str) -> dict[str, Any]:
     """Run the relevant Apify actor for Instagram / TikTok / LinkedIn and
     normalize the result into text + handle + media."""
@@ -159,9 +175,12 @@ def extract_social(url: str, platform: str) -> dict[str, Any]:
     elif platform == "instagram":
         run_input = {"directUrls": [url]}
     else:
-        # LinkedIn actor's exact schema is unverified — keep the previous
-        # defensive multi-key guess rather than change untested behavior.
-        run_input = {"directUrls": [url], "urls": [url], "postUrls": [url]}
+        # LinkedIn. Verified against real live output (2026-08-07): the
+        # previously configured actor `apify/linkedin-post-scraper` doesn't
+        # exist at all (confirmed via Apify's own API — every LinkedIn save
+        # was failing outright, not just extracting badly). Replaced with
+        # supreme_coder/linkedin-post, whose real schema just needs `urls`.
+        run_input = {"urls": [url], "limitPerSource": 1}
 
     run = apify_client.actor(actor_id).call(run_input=run_input)
     if run is None:
@@ -198,7 +217,11 @@ def extract_social(url: str, platform: str) -> dict[str, Any]:
     # it to download) media URL in `mediaUrls`. Keep this separate from still
     # images so it's uploaded to Gemini as an actual video (audio + motion +
     # on-screen text) instead of being treated as a photo.
-    video_url = item.get("videoUrl") or next(iter(item.get("mediaUrls") or []), None)
+    video_url = (
+        item.get("videoUrl")
+        or next(iter(item.get("mediaUrls") or []), None)
+        or extract_linkedin_video_url(item)
+    )
 
     images = []
     if item.get("displayUrl"):
