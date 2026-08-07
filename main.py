@@ -205,6 +205,16 @@ def extract_social(url: str, platform: str) -> dict[str, Any]:
         images.append(item["displayUrl"])
     if item.get("images"):
         images.extend(item["images"])
+    if item.get("isSlideshow"):
+        # TikTok "photo mode" posts have no video at all — mediaUrls is empty
+        # and videoMeta is all zeros. The actual carousel lives in
+        # slideshowImageLinks instead; downloadLink is Apify's own hosted,
+        # non-expiring copy (preferred over the signed/expiring tiktokLink).
+        # Confirmed via a real slideshow post (2026-08-07): mediaUrls == [].
+        for slide in item.get("slideshowImageLinks") or []:
+            link = slide.get("downloadLink") or slide.get("tiktokLink")
+            if link:
+                images.append(link)
     if not video_url and item.get("coverUrl"):
         # Cover thumbnail is only useful as a fallback when there's no actual
         # video to analyze (e.g. actor failed to return a video URL).
@@ -226,6 +236,19 @@ def extract_social(url: str, platform: str) -> dict[str, Any]:
         "images": [img for img in images if img],
         "video_url": video_url,
     }
+
+
+def with_apify_auth(url: str) -> str:
+    """Apify's own key-value-store URLs (returned when we set
+    shouldDownloadVideos/shouldDownloadSlideshowImages/shouldDownloadCovers)
+    are private by default and 403 on a plain unauthenticated GET — confirmed
+    against a real TikTok video URL (2026-08-07). Append the API token only
+    for Apify-hosted URLs; third-party CDN links (Instagram, TikTok's own
+    signed URLs) don't accept or need it."""
+    if urlparse(url).netloc == "api.apify.com":
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}token={APIFY_API_TOKEN}"
+    return url
 
 
 def extract_general(url: str) -> dict[str, Any]:
@@ -338,7 +361,7 @@ def build_video_part(extracted: dict[str, Any]) -> tuple[Optional[Any], Optional
     tmp_path = None
     try:
         log.info("Gemini: downloading video for upload: %s", video_url)
-        resp = requests.get(video_url, timeout=60, stream=True)
+        resp = requests.get(with_apify_auth(video_url), timeout=60, stream=True)
         resp.raise_for_status()
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
             for chunk in resp.iter_content(chunk_size=1 << 20):
@@ -371,7 +394,7 @@ def ocr_image_slide(image_url: str, index: int) -> Optional[str]:
     isn't an image, or Gemini returns nothing — callers should skip it rather
     than fail the whole carousel over one bad slide."""
     try:
-        img_resp = requests.get(image_url, timeout=15)
+        img_resp = requests.get(with_apify_auth(image_url), timeout=15)
         img_resp.raise_for_status()
         mime_type = img_resp.headers.get("Content-Type", "image/jpeg").split(";")[0]
         if not mime_type.startswith("image/"):
@@ -432,7 +455,7 @@ def call_gemini(url: str, extracted: dict[str, Any]) -> dict[str, Any]:
         # Single image (plain photo post, or a cover-thumbnail fallback) —
         # cheap enough to send inline with the main tagging call.
         try:
-            img_resp = requests.get(images[0], timeout=15)
+            img_resp = requests.get(with_apify_auth(images[0]), timeout=15)
             img_resp.raise_for_status()
             mime_type = img_resp.headers.get("Content-Type", "image/jpeg").split(";")[0]
             if mime_type.startswith("image/"):
