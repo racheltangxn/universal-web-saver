@@ -388,6 +388,36 @@ def build_video_part(extracted: dict[str, Any]) -> tuple[Optional[Any], Optional
             os.unlink(tmp_path)
 
 
+GEMINI_RETRY_MAX_ATTEMPTS = 3
+GEMINI_RETRY_BACKOFF_BASE_S = 3
+
+
+def generate_content_with_retry(**kwargs: Any) -> Any:
+    """gemini_client.models.generate_content, with a short bounded retry for
+    Gemini's own transient 503 UNAVAILABLE ("high demand") errors — seen
+    repeatedly in production (2026-08-07): 5 of 18 carousel slide OCR calls
+    and 3 of 3 attempts on one video's tagging call all hit this in the same
+    session. Not retried for any other error type."""
+    last_error: Optional[Exception] = None
+    for attempt in range(GEMINI_RETRY_MAX_ATTEMPTS):
+        try:
+            return gemini_client.models.generate_content(**kwargs)
+        except Exception as e:
+            is_503 = "503" in str(e) or "UNAVAILABLE" in str(e)
+            if not is_503 or attempt == GEMINI_RETRY_MAX_ATTEMPTS - 1:
+                raise
+            last_error = e
+            wait_s = GEMINI_RETRY_BACKOFF_BASE_S * (2**attempt)
+            log.warning(
+                "Gemini: 503 (high demand), retrying in %ds (attempt %d/%d)",
+                wait_s,
+                attempt + 1,
+                GEMINI_RETRY_MAX_ATTEMPTS,
+            )
+            time.sleep(wait_s)
+    raise last_error  # unreachable — loop above always returns or raises
+
+
 def ocr_image_slide(image_url: str, index: int) -> Optional[str]:
     """Download one carousel slide and OCR just that image in its own Gemini
     call, labeled by position. Returns None if the slide can't be downloaded,
@@ -405,7 +435,7 @@ def ocr_image_slide(image_url: str, index: int) -> Optional[str]:
         return None
 
     try:
-        response = gemini_client.models.generate_content(
+        response = generate_content_with_retry(
             model=GEMINI_MODEL,
             contents=[
                 "OCR every piece of visible text in this image, verbatim, in reading order. "
@@ -471,7 +501,7 @@ def call_gemini(url: str, extracted: dict[str, Any]) -> dict[str, Any]:
         len(slide_texts),
     )
     try:
-        response = gemini_client.models.generate_content(
+        response = generate_content_with_retry(
             model=GEMINI_MODEL,
             contents=parts,
             config=genai_types.GenerateContentConfig(
