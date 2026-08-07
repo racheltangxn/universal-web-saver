@@ -142,10 +142,41 @@ def extract_social(url: str, platform: str) -> dict[str, Any]:
     actor_id = actor_map[platform]
     log.info("%s: running Apify actor %s for %s", platform, actor_id, url)
 
-    run_input = {"directUrls": [url], "urls": [url], "postUrls": [url]}
+    # Input field names are actor-specific, not interchangeable — verified
+    # against each actor's real input schema (2026-08-07). clockworks/tiktok-scraper
+    # requires `postURLs` (capital URL) specifically; the previous shared
+    # `postUrls` key was silently rejected by TikTok's schema validation on
+    # every single run, 100% failure. `shouldDownloadVideos`/`shouldDownloadSlideshowImages`
+    # make the actor persist a non-expiring media URL (field `mediaUrls`)
+    # instead of only a signed CDN link.
+    if platform == "tiktok":
+        run_input: dict[str, Any] = {
+            "postURLs": [url],
+            "shouldDownloadVideos": True,
+            "shouldDownloadCovers": True,
+            "shouldDownloadSlideshowImages": True,
+        }
+    elif platform == "instagram":
+        run_input = {"directUrls": [url]}
+    else:
+        # LinkedIn actor's exact schema is unverified — keep the previous
+        # defensive multi-key guess rather than change untested behavior.
+        run_input = {"directUrls": [url], "urls": [url], "postUrls": [url]}
+
     run = apify_client.actor(actor_id).call(run_input=run_input)
     if run is None:
         raise ValueError(f"Apify actor {actor_id} run failed to start for {url}")
+
+    # Fail loudly on a non-SUCCEEDED run (e.g. actor-level input rejection)
+    # instead of silently falling through to an empty/garbage item — this is
+    # exactly how every TikTok save failed invisibly before this fix.
+    run_status = getattr(run, "status", None)
+    if run_status and run_status != "SUCCEEDED":
+        status_message = getattr(run, "status_message", None)
+        raise ValueError(
+            f"Apify actor {actor_id} run did not succeed (status={run_status}): {status_message}"
+        )
+
     # apify-client 3.x returns a typed Run model (snake_case attrs), not a dict.
     items = list(apify_client.dataset(run.default_dataset_id).iterate_items())
 
@@ -162,10 +193,12 @@ def extract_social(url: str, platform: str) -> dict[str, Any]:
         or item.get("author", {}).get("username")
         or item.get("authorName")
     )
-    # Video posts (Reels/TikTok/LinkedIn video) get a `videoUrl` — keep that
-    # separate from still images so it's uploaded to Gemini as an actual video
-    # (audio + motion + on-screen text) instead of being treated as a photo.
-    video_url = item.get("videoUrl")
+    # Video posts (Reels/TikTok/LinkedIn video) get a `videoUrl` on most actors;
+    # clockworks/tiktok-scraper instead puts its (non-expiring, since we asked
+    # it to download) media URL in `mediaUrls`. Keep this separate from still
+    # images so it's uploaded to Gemini as an actual video (audio + motion +
+    # on-screen text) instead of being treated as a photo.
+    video_url = item.get("videoUrl") or next(iter(item.get("mediaUrls") or []), None)
 
     images = []
     if item.get("displayUrl"):
@@ -176,6 +209,13 @@ def extract_social(url: str, platform: str) -> dict[str, Any]:
         # Cover thumbnail is only useful as a fallback when there's no actual
         # video to analyze (e.g. actor failed to return a video URL).
         images.append(item["coverUrl"])
+
+    if not caption and not handle and not images and not video_url:
+        # A "successful" run can still return a content-free item. Treat that
+        # as a failure instead of silently creating an empty "Platform post by
+        # unknown" Notion page, which is what happened for every TikTok save
+        # before this fix.
+        raise ValueError(f"{platform} actor returned an empty/unusable item for {url}")
 
     title = caption[:120] if caption else f"{platform.title()} post by {handle or 'unknown'}"
 
@@ -272,6 +312,10 @@ def normalize_category(raw_category: str) -> str:
 
 GEMINI_FILE_POLL_INTERVAL_S = 2
 GEMINI_FILE_POLL_TIMEOUT_S = 90
+# Carousels can run to 20+ slides; a single combined Gemini request can
+# silently skip slides even when all images are attached, so each slide is
+# OCR'd in its own call instead and the results aggregated before tagging.
+GEMINI_MAX_CAROUSEL_SLIDES = 20
 
 
 def build_video_part(extracted: dict[str, Any]) -> tuple[Optional[Any], Optional[str]]:
@@ -321,26 +365,74 @@ def build_video_part(extracted: dict[str, Any]) -> tuple[Optional[Any], Optional
             os.unlink(tmp_path)
 
 
+def ocr_image_slide(image_url: str, index: int) -> Optional[str]:
+    """Download one carousel slide and OCR just that image in its own Gemini
+    call, labeled by position. Returns None if the slide can't be downloaded,
+    isn't an image, or Gemini returns nothing — callers should skip it rather
+    than fail the whole carousel over one bad slide."""
+    try:
+        img_resp = requests.get(image_url, timeout=15)
+        img_resp.raise_for_status()
+        mime_type = img_resp.headers.get("Content-Type", "image/jpeg").split(";")[0]
+        if not mime_type.startswith("image/"):
+            log.warning("Gemini: slide %d has non-image content-type %s, skipping", index, mime_type)
+            return None
+    except requests.RequestException as e:
+        log.warning("Gemini: could not download slide %d (%s): %s", index, image_url, e)
+        return None
+
+    try:
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                "OCR every piece of visible text in this image, verbatim, in reading order. "
+                "If there is no text, briefly describe what's shown instead.",
+                genai_types.Part.from_bytes(data=img_resp.content, mime_type=mime_type),
+            ],
+        )
+        text = (response.text or "").strip()
+        return f"Slide {index}: {text}" if text else None
+    except Exception as e:
+        log.warning("Gemini: OCR failed for slide %d (%s): %s", index, image_url, e)
+        return None
+
+
 def call_gemini(url: str, extracted: dict[str, Any]) -> dict[str, Any]:
     """Send extracted text (and optional images/video) to Gemini and get back
     structured JSON tags."""
+    video_part, gemini_file_to_cleanup = build_video_part(extracted)
+    images = (extracted.get("images") or [])[:GEMINI_MAX_CAROUSEL_SLIDES]
+
+    content = extracted.get("text") or ""
+    slide_texts: list[str] = []
+    if not video_part and len(images) > 1:
+        # Multi-slide carousel: OCR each slide separately and aggregate into
+        # the text content, rather than attaching every image to one combined
+        # request (see GEMINI_MAX_CAROUSEL_SLIDES comment above).
+        log.info("Gemini: OCR'ing %d carousel slide(s) individually", len(images))
+        for i, image_url in enumerate(images, start=1):
+            slide_text = ocr_image_slide(image_url, i)
+            if slide_text:
+                slide_texts.append(slide_text)
+        if slide_texts:
+            content += "\n\n" + "\n\n".join(slide_texts)
+
     prompt = TAGGING_PROMPT.format(
         url=url,
         author_name=extracted.get("author_name"),
         category_options=", ".join(CATEGORY_OPTIONS),
-        content=(extracted.get("text") or "")[:50000],  # keep prompt bounded
+        content=content[:50000],  # keep prompt bounded
     )
 
     parts: list[Any] = [prompt]
 
-    video_part, gemini_file_to_cleanup = build_video_part(extracted)
     if video_part:
         parts.append(video_part)
-
-    # Still images (photo posts/carousels, or a cover thumbnail fallback).
-    for image_url in (extracted.get("images") or [])[:3]:
+    elif len(images) == 1:
+        # Single image (plain photo post, or a cover-thumbnail fallback) —
+        # cheap enough to send inline with the main tagging call.
         try:
-            img_resp = requests.get(image_url, timeout=15)
+            img_resp = requests.get(images[0], timeout=15)
             img_resp.raise_for_status()
             mime_type = img_resp.headers.get("Content-Type", "image/jpeg").split(";")[0]
             if mime_type.startswith("image/"):
@@ -348,9 +440,13 @@ def call_gemini(url: str, extracted: dict[str, Any]) -> dict[str, Any]:
                     genai_types.Part.from_bytes(data=img_resp.content, mime_type=mime_type)
                 )
         except requests.RequestException as e:
-            log.warning("Gemini: could not download media %s (%s)", image_url, e)
+            log.warning("Gemini: could not download media %s (%s)", images[0], e)
 
-    log.info("Gemini: sending %d part(s) for analysis", len(parts))
+    log.info(
+        "Gemini: sending %d part(s) for analysis (%d carousel slide(s) pre-OCR'd)",
+        len(parts),
+        len(slide_texts),
+    )
     try:
         response = gemini_client.models.generate_content(
             model=GEMINI_MODEL,
