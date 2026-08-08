@@ -25,6 +25,7 @@ import logging
 import os
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -362,6 +363,12 @@ GEMINI_FILE_POLL_TIMEOUT_S = 90
 # silently skip slides even when all images are attached, so each slide is
 # OCR'd in its own call instead and the results aggregated before tagging.
 GEMINI_MAX_CAROUSEL_SLIDES = 20
+# Slide OCR calls are independent, so run them concurrently instead of
+# sequentially — a 20-slide carousel run one-at-a-time (each with its own
+# up-to-3-attempt 503 retry/backoff) was the single biggest source of
+# worst-case webhook latency. Capped well under Gemini's per-project rate
+# limit rather than left unbounded.
+GEMINI_OCR_MAX_WORKERS = 6
 
 
 def build_video_part(extracted: dict[str, Any]) -> tuple[Optional[Any], Optional[str]]:
@@ -484,12 +491,20 @@ def call_gemini(url: str, extracted: dict[str, Any]) -> dict[str, Any]:
     if not video_part and len(images) > 1:
         # Multi-slide carousel: OCR each slide separately and aggregate into
         # the text content, rather than attaching every image to one combined
-        # request (see GEMINI_MAX_CAROUSEL_SLIDES comment above).
-        log.info("Gemini: OCR'ing %d carousel slide(s) individually", len(images))
-        for i, image_url in enumerate(images, start=1):
-            slide_text = ocr_image_slide(image_url, i)
-            if slide_text:
-                slide_texts.append(slide_text)
+        # request (see GEMINI_MAX_CAROUSEL_SLIDES comment above). Run the
+        # per-slide calls concurrently (see GEMINI_OCR_MAX_WORKERS) — order is
+        # preserved by executor.map regardless of completion order, and each
+        # slide is already labeled by its own index inside ocr_image_slide.
+        log.info(
+            "Gemini: OCR'ing %d carousel slide(s), %d concurrent",
+            len(images),
+            min(GEMINI_OCR_MAX_WORKERS, len(images)),
+        )
+        with ThreadPoolExecutor(max_workers=min(GEMINI_OCR_MAX_WORKERS, len(images))) as executor:
+            ocr_results = list(
+                executor.map(lambda pair: ocr_image_slide(pair[1], pair[0]), enumerate(images, start=1))
+            )
+        slide_texts = [text for text in ocr_results if text]
         if slide_texts:
             content += "\n\n" + "\n\n".join(slide_texts)
 
@@ -609,27 +624,30 @@ def get_data_source_id() -> str:
     return _data_source_id
 
 
-def find_existing_page(url: str) -> Optional[str]:
-    """Return the page ID already saved for this URL, if any. Guards against
-    duplicate pages when a client (e.g. a timed-out HTTP Shortcuts request)
-    retries the same webhook call."""
+def find_existing_page(url: str) -> Optional[dict[str, Any]]:
+    """Return {"id", "title"} for the page already saved for this URL, if any.
+    Checked at the top of process_url (before any Apify/Gemini work) so a
+    retried webhook call (e.g. a phone client re-sending after its own
+    timeout fires) short-circuits immediately instead of redoing the slowest,
+    most expensive stages just to discover it's a duplicate at the very end."""
     results = notion.data_sources.query(
         data_source_id=get_data_source_id(),
         filter={"property": "External ID", "rich_text": {"equals": url[:2000]}},
         page_size=1,
     )
     pages = results.get("results") or []
-    return pages[0]["id"] if pages else None
+    if not pages:
+        return None
+    page = pages[0]
+    title_parts = (page.get("properties", {}).get("Title", {}).get("title") or [])
+    title = title_parts[0]["plain_text"] if title_parts else url
+    return {"id": page["id"], "title": title}
 
 
 def push_to_notion(url: str, platform: str, title: str, ai_data: dict[str, Any]) -> str:
     """Create a Notion page with mapped properties + transcription page content.
-    Returns the new (or existing, if already saved) page ID."""
-    existing_id = find_existing_page(url)
-    if existing_id:
-        log.info("Notion: %s already saved as page %s, skipping duplicate create", url, existing_id)
-        return existing_id
-
+    Returns the new page ID. Callers are expected to have already checked
+    find_existing_page — this always creates."""
     properties = {
         "Title": {"title": [{"text": {"content": title[:2000] or url}}]},
         "URL": {"url": url},
@@ -680,6 +698,16 @@ def process_url(url: str) -> dict[str, Any]:
     result instead of being swallowed, so the caller can report what actually
     happened."""
     log.info("=== Processing %s ===", url)
+
+    try:
+        existing = find_existing_page(url)
+    except Exception:
+        log.exception("Dedup check failed for %s, proceeding as new save", url)
+        existing = None
+    if existing:
+        log.info("Notion: %s already saved as page %s, skipping re-extraction", url, existing["id"])
+        return {"ok": True, "title": existing["title"], "notion_page_id": existing["id"]}
+
     try:
         platform, extracted = route_and_extract(url)
     except Exception as e:
