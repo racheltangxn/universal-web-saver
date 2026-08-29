@@ -21,12 +21,16 @@ Run:
 """
 
 import hmac
+import hashlib
+import json
 import logging
 import os
+import re
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime
+from threading import Lock
+from datetime import date, datetime, timedelta
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -58,6 +62,15 @@ APIFY_API_TOKEN = os.environ["APIFY_API_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 NOTION_API_KEY = os.environ["NOTION_API_KEY"]
 NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
+CONTACTS_DATA_SOURCE_ID = os.environ.get(
+    "CONTACTS_DATA_SOURCE_ID", "1a53f27f-73ec-806f-b581-000b125f159f"
+)
+FESTIVALS_DATA_SOURCE_ID = os.environ.get(
+    "FESTIVALS_DATA_SOURCE_ID", "3e73e3c8-520d-441a-bb6a-113ed6def096"
+)
+EDITIONS_DATA_SOURCE_ID = os.environ.get(
+    "EDITIONS_DATA_SOURCE_ID", "5946e4d5-8a32-439f-b213-cc0e705d11ac"
+)
 
 # Apify actor IDs — override in .env if you use different actors.
 APIFY_INSTAGRAM_ACTOR = os.environ.get("APIFY_INSTAGRAM_ACTOR", "apify/instagram-scraper")
@@ -68,13 +81,28 @@ APIFY_LINKEDIN_ACTOR = os.environ.get("APIFY_LINKEDIN_ACTOR", "supreme_coder/lin
 # platforms instead. starvibe/youtube-video-transcript picked for its 99.99%
 # success rate across ~490k runs at evaluation time (2026-07-28).
 APIFY_YOUTUBE_ACTOR = os.environ.get("APIFY_YOUTUBE_ACTOR", "starvibe/youtube-video-transcript")
+APIFY_RUN_TIMEOUT_S = int(os.environ.get("APIFY_RUN_TIMEOUT_S", "60"))
+APIFY_WAIT_TIMEOUT_S = int(os.environ.get("APIFY_WAIT_TIMEOUT_S", "65"))
+APIFY_HTTP_TIMEOUT_S = int(os.environ.get("APIFY_HTTP_TIMEOUT_S", "70"))
+MONITOR_MAX_SOURCES = int(os.environ.get("MONITOR_MAX_SOURCES", "25"))
+MONITOR_MAX_ITEMS_PER_SOURCE = int(os.environ.get("MONITOR_MAX_ITEMS_PER_SOURCE", "5"))
+# Keep live extraction bounded when an AI provider is under transient load.
+# Dry-run discovery still reports the full per-source candidate set.
+MONITOR_MAX_LIVE_ITEMS_PER_SOURCE = int(os.environ.get("MONITOR_MAX_LIVE_ITEMS_PER_SOURCE", "2"))
+MONITOR_RUN_LOCK = Lock()
+MONITOR_HTTP_TIMEOUT_S = int(os.environ.get("MONITOR_HTTP_TIMEOUT_S", "45"))
+FIRECRAWL_API_KEY = os.environ.get("FIRECRAWL_API_KEY")
+FIRECRAWL_API_URL = os.environ.get("FIRECRAWL_API_URL", "https://api.firecrawl.dev")
 
 JINA_READER_BASE = "https://r.jina.ai/"
 # "gemini-1.5-flash" was the original spec's model; that line (and even 2.5-flash)
 # is now retired for new API keys. "gemini-flash-latest" is Google's rolling
 # alias to the current-gen Flash model, so this default won't rot again.
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
-NOTION_BLOCK_CHAR_LIMIT = 2000
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
+# Notion's limit is measured differently for some Unicode text; keep a
+# conservative margin so page creation cannot leave an orphan on append.
+NOTION_BLOCK_CHAR_LIMIT = 1800
 
 apify_client = ApifyClient(APIFY_API_TOKEN)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -102,6 +130,16 @@ def classify_url(url: str) -> str:
     return "general"
 
 
+def run_apify_actor(actor_id: str, run_input: dict[str, Any]) -> Any:
+    """Run an actor with bounded actor, wait, and API request timeouts."""
+    return apify_client.actor(actor_id).call(
+        run_input=run_input,
+        run_timeout=timedelta(seconds=APIFY_RUN_TIMEOUT_S),
+        wait_duration=timedelta(seconds=APIFY_WAIT_TIMEOUT_S),
+        timeout=timedelta(seconds=APIFY_HTTP_TIMEOUT_S),
+    )
+
+
 def extract_youtube(url: str) -> dict[str, Any]:
     """Fetch transcript + title/channel for a YouTube video via Apify (direct
     youtube-transcript-api calls get blocked from cloud-provider IPs), and
@@ -109,13 +147,18 @@ def extract_youtube(url: str) -> dict[str, Any]:
     fetches YouTube URLs natively, so it can watch/listen to the actual video
     (on-screen text, visuals) instead of relying only on the caption track."""
     log.info("YouTube: running Apify actor %s for %s", APIFY_YOUTUBE_ACTOR, url)
-    run = apify_client.actor(APIFY_YOUTUBE_ACTOR).call(
-        run_input={"youtube_url": url, "include_transcript_text": True}
+    run = run_apify_actor(
+        APIFY_YOUTUBE_ACTOR,
+        {"youtube_url": url, "include_transcript_text": True},
     )
     if run is None:
         raise ValueError(f"Apify actor {APIFY_YOUTUBE_ACTOR} run failed to start for {url}")
 
-    items = list(apify_client.dataset(run.default_dataset_id).iterate_items())
+    items = list(
+        apify_client.dataset(run.default_dataset_id).iterate_items(
+            limit=1, timeout=timedelta(seconds=APIFY_HTTP_TIMEOUT_S)
+        )
+    )
     if not items:
         raise ValueError(f"Apify actor {APIFY_YOUTUBE_ACTOR} returned no items for {url}")
 
@@ -183,7 +226,7 @@ def extract_social(url: str, platform: str) -> dict[str, Any]:
         # supreme_coder/linkedin-post, whose real schema just needs `urls`.
         run_input = {"urls": [url], "limitPerSource": 1}
 
-    run = apify_client.actor(actor_id).call(run_input=run_input)
+    run = run_apify_actor(actor_id, run_input)
     if run is None:
         raise ValueError(f"Apify actor {actor_id} run failed to start for {url}")
 
@@ -198,7 +241,11 @@ def extract_social(url: str, platform: str) -> dict[str, Any]:
         )
 
     # apify-client 3.x returns a typed Run model (snake_case attrs), not a dict.
-    items = list(apify_client.dataset(run.default_dataset_id).iterate_items())
+    items = list(
+        apify_client.dataset(run.default_dataset_id).iterate_items(
+            limit=1, timeout=timedelta(seconds=APIFY_HTTP_TIMEOUT_S)
+        )
+    )
 
     if not items:
         raise ValueError(f"Apify actor {actor_id} returned no items for {url}")
@@ -327,6 +374,18 @@ CATEGORY_OPTIONS = [
     "News", "Business", "Career", "Creative", "Wellness", "Other",
 ]
 
+# A separate routing taxonomy keeps the existing broad Category field stable.
+# These values are also the recommended options for the Notion select property.
+ROUTING_CATEGORY_OPTIONS = [
+    "Events",
+    "Follow-Up / To-Do",
+    "AI & Tech",
+    "People / Contacts",
+    "Travel / Festivals",
+    "Knowledge",
+    "Other",
+]
+
 TAGGING_PROMPT = """You are a universal tagging engine for a personal "MyMind"-style
 knowledge base. You will be given the extracted text, and possibly images or a video,
 from a saved web link. Analyze it and return STRICT JSON matching this schema:
@@ -335,9 +394,24 @@ from a saved web link. Analyze it and return STRICT JSON matching this schema:
   "transcription": "The full verbatim content. For a video: the spoken-word audio transcript AND any on-screen/overlay/caption text, each clearly labeled (e.g. 'Spoken:' / 'On-screen text:'). For images: OCR'd text. For articles: the full body text.",
   "ai_summary": "A 2-sentence summary of the link's core value or main thesis",
   "category": "Exactly one of: {category_options}",
+  "routing_category": "Exactly one of: {routing_category_options}; choose the destination/use-case, not the broad topic",
   "tags": ["Tag1", "Tag2", "Tag3"],
   "vibe": "Short description of tone/aesthetic (e.g., 'Educational', 'Minimalist', 'Opinionated')",
-  "author_name": "Name of the creator, author, or website publisher"
+  "author_name": "Name of the creator, author, or website publisher",
+  "city": "Explicit city or null",
+  "country": "Explicit country or null",
+  "event_date": "Legacy single event date; use event_start for new captures",
+  "event_start": "ISO date or datetime or null; only when clearly stated",
+  "event_end": "ISO date or datetime or null; only when clearly stated",
+  "event_status": "Upcoming, Past, Ongoing, or null",
+  "relevance_score": 0,
+  "routing_status": "Inbox, Needs Review, or Actionable",
+  "discovery_source": "Short source label such as Instagram, Luma, or Web",
+  "why_it_matched": "One short sentence explaining why this is worth saving",
+  "related_contact_name": "Exact existing contact name only; otherwise null",
+  "related_festival_name": "Exact existing festival name only; otherwise null",
+  "related_edition_name": "Exact existing edition name only; otherwise null",
+  "is_recurring_festival": false
 }}
 
 Source URL: {url}
@@ -357,15 +431,22 @@ def normalize_category(raw_category: str) -> str:
     return lookup.get((raw_category or "").strip().lower(), "Other")
 
 
+def normalize_routing_category(raw_category: str) -> str:
+    """Coerce Gemini's routing category to the controlled select options."""
+    lookup = {opt.casefold(): opt for opt in ROUTING_CATEGORY_OPTIONS}
+    return lookup.get((raw_category or "").strip().casefold(), "Other")
+
+
 GEMINI_FILE_POLL_INTERVAL_S = 2
 GEMINI_FILE_POLL_TIMEOUT_S = 90
 # Carousels can run to 20+ slides; a single combined Gemini request can
 # silently skip slides even when all images are attached, so each slide is
 # OCR'd in its own call instead and the results aggregated before tagging.
-GEMINI_MAX_CAROUSEL_SLIDES = 20
+# Keep the bounded OCR workload below the monitor request budget.
+GEMINI_MAX_CAROUSEL_SLIDES = int(os.environ.get("GEMINI_MAX_CAROUSEL_SLIDES", "8"))
 # Slide OCR calls are independent, so run them concurrently instead of
 # sequentially — a 20-slide carousel run one-at-a-time (each with its own
-# up-to-3-attempt 503 retry/backoff) was the single biggest source of
+# bounded 503 retry/backoff) was the single biggest source of
 # worst-case webhook latency. Capped well under Gemini's per-project rate
 # limit rather than left unbounded.
 GEMINI_OCR_MAX_WORKERS = 6
@@ -418,24 +499,29 @@ def build_video_part(extracted: dict[str, Any]) -> tuple[Optional[Any], Optional
             os.unlink(tmp_path)
 
 
-GEMINI_RETRY_MAX_ATTEMPTS = 3
-GEMINI_RETRY_BACKOFF_BASE_S = 3
+# Gemini can return short-lived 503 high-demand responses even when the
+# service is healthy. Keep retries bounded, but give a transient incident
+# enough time to clear before failing the capture.
+GEMINI_RETRY_MAX_ATTEMPTS = 5
+GEMINI_RETRY_BACKOFF_BASE_S = 5
 
 
 def generate_content_with_retry(**kwargs: Any) -> Any:
-    """gemini_client.models.generate_content, with a short bounded retry for
+    """gemini_client.models.generate_content, with a bounded retry for
     Gemini's own transient 503 UNAVAILABLE ("high demand") errors — seen
     repeatedly in production (2026-08-07): 5 of 18 carousel slide OCR calls
     and 3 of 3 attempts on one video's tagging call all hit this in the same
     session. Not retried for any other error type."""
     last_error: Optional[Exception] = None
+    primary_model = kwargs.get("model")
     for attempt in range(GEMINI_RETRY_MAX_ATTEMPTS):
         try:
             return gemini_client.models.generate_content(**kwargs)
         except Exception as e:
             is_503 = "503" in str(e) or "UNAVAILABLE" in str(e)
             if not is_503 or attempt == GEMINI_RETRY_MAX_ATTEMPTS - 1:
-                raise
+                last_error = e
+                break
             last_error = e
             wait_s = GEMINI_RETRY_BACKOFF_BASE_S * (2**attempt)
             log.warning(
@@ -445,7 +531,18 @@ def generate_content_with_retry(**kwargs: Any) -> Any:
                 GEMINI_RETRY_MAX_ATTEMPTS,
             )
             time.sleep(wait_s)
-    raise last_error  # unreachable — loop above always returns or raises
+
+    if last_error and primary_model != GEMINI_FALLBACK_MODEL:
+        log.warning("Gemini: primary model unavailable; trying fallback model %s", GEMINI_FALLBACK_MODEL)
+        fallback_kwargs = {**kwargs, "model": GEMINI_FALLBACK_MODEL}
+        try:
+            return gemini_client.models.generate_content(**fallback_kwargs)
+        except Exception as fallback_error:
+            if "503" not in str(fallback_error) and "UNAVAILABLE" not in str(fallback_error):
+                raise
+            last_error = fallback_error
+
+    raise last_error  # unreachable only when the client returns successfully
 
 
 def ocr_image_slide(image_url: str, index: int) -> Optional[str]:
@@ -512,6 +609,7 @@ def call_gemini(url: str, extracted: dict[str, Any]) -> dict[str, Any]:
         url=url,
         author_name=extracted.get("author_name"),
         category_options=", ".join(CATEGORY_OPTIONS),
+        routing_category_options=", ".join(ROUTING_CATEGORY_OPTIONS),
         content=content[:50000],  # keep prompt bounded
     )
 
@@ -561,13 +659,30 @@ def call_gemini(url: str, extracted: dict[str, Any]) -> dict[str, Any]:
     result.setdefault("transcription", extracted.get("text", ""))
     result.setdefault("ai_summary", "")
     result.setdefault("category", "Other")
+    result.setdefault("routing_category", "Other")
     result.setdefault("tags", [])
     result.setdefault("vibe", "")
     result.setdefault("author_name", extracted.get("author_name"))
+    result.setdefault("city", None)
+    result.setdefault("country", None)
+    result.setdefault("event_date", None)
+    result.setdefault("event_start", result.get("event_date"))
+    result.setdefault("event_end", None)
+    result["event_date"] = result.get("event_date") or result.get("event_start")
+    result.setdefault("event_status", None)
+    result.setdefault("relevance_score", 0)
+    result.setdefault("routing_status", "Inbox")
+    result.setdefault("discovery_source", "Web")
+    result.setdefault("why_it_matched", "")
+    result.setdefault("related_contact_name", None)
+    result.setdefault("related_festival_name", None)
+    result.setdefault("related_edition_name", None)
+    result.setdefault("is_recurring_festival", False)
 
     # The Notion "Category" property is a fixed-option select — coerce
     # whatever Gemini returned onto one of the allowed options.
     result["category"] = normalize_category(result["category"])
+    result["routing_category"] = normalize_routing_category(result["routing_category"])
 
     return result
 
@@ -607,6 +722,449 @@ SOURCE_TYPE_MAP = {
 
 
 _data_source_id: Optional[str] = None
+_database_properties: Optional[dict[str, Any]] = None
+
+
+def normalize_entity_name(value: str) -> str:
+    return " ".join((value or "").casefold().split())
+
+
+def normalize_source_url(value: Optional[str]) -> str:
+    """Canonicalize a configured source URL for deterministic matching."""
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    parsed = urlparse(value.strip())
+    scheme = (parsed.scheme or "https").lower()
+    host = parsed.netloc.lower().removeprefix("www.")
+    path = parsed.path.rstrip("/") or "/"
+    return f"{scheme}://{host}{path}"
+
+
+def find_monitored_source_page(source_url: Optional[str]) -> Optional[str]:
+    """Return one exact source-record match, never creating or guessing one."""
+    wanted = normalize_source_url(source_url)
+    if not wanted:
+        return None
+    query = {
+        "data_source_id": CONTACTS_DATA_SOURCE_ID,
+        "filter": {"property": "Record Type", "select": {"equals": "Monitored Source"}},
+        "page_size": 100,
+    }
+    try:
+        pages = []
+        while True:
+            results = notion.data_sources.query(**query)
+            pages.extend(results.get("results") or [])
+            if not results.get("has_more"):
+                break
+            next_cursor = results.get("next_cursor")
+            if not next_cursor:
+                log.warning("Notion: source lookup returned has_more without next_cursor")
+                break
+            query["start_cursor"] = next_cursor
+    except Exception as e:
+        log.warning("Notion: source lookup failed for %r (%s)", source_url, e)
+        return None
+
+    matches = []
+    for page in pages:
+        source_prop = (page.get("properties") or {}).get("Source URL", {})
+        source_value = source_prop.get("url")
+        if normalize_source_url(source_value) == wanted:
+            matches.append(page["id"])
+    return matches[0] if len(matches) == 1 else None
+
+
+def list_monitored_sources() -> list[dict[str, Any]]:
+    """Read the existing Contacts source registry without creating records.
+
+    Monitoring is opt-in: only rows marked Monitored Source, enabled, and
+    Active are eligible for a future poller. The cap prevents one malformed
+    or unexpectedly large Contacts database from turning a scheduler tick
+    into an unbounded scrape run.
+    """
+    query = {
+        "data_source_id": CONTACTS_DATA_SOURCE_ID,
+        "filter": {
+            "and": [
+                {"property": "Record Type", "select": {"equals": "Monitored Source"}},
+                {"property": "Monitoring Enabled", "checkbox": {"equals": True}},
+                {"property": "Monitoring Status", "select": {"equals": "Active"}},
+            ]
+        },
+        "page_size": min(MONITOR_MAX_SOURCES, 100),
+    }
+    pages: list[dict[str, Any]] = []
+    while len(pages) < MONITOR_MAX_SOURCES:
+        results = notion.data_sources.query(**query)
+        pages.extend(results.get("results") or [])
+        if not results.get("has_more") or not results.get("next_cursor"):
+            break
+        query["start_cursor"] = results["next_cursor"]
+
+    sources = []
+    for page in pages[:MONITOR_MAX_SOURCES]:
+        props = page.get("properties") or {}
+        title_parts = (props.get("Name", {}).get("title") or [])
+        name = "".join(part.get("plain_text", "") for part in title_parts).strip()
+        source_url = props.get("Source URL", {}).get("url")
+        source_type = (props.get("Source Type", {}).get("select") or {}).get("name")
+        polling_frequency = (props.get("Polling Frequency", {}).get("select") or {}).get("name")
+        monitoring_enabled = bool(props.get("Monitoring Enabled", {}).get("checkbox"))
+        monitoring_status = (props.get("Monitoring Status", {}).get("select") or {}).get("name")
+        include_keywords = [
+            part.strip().casefold()
+            for part in "".join(
+                item.get("plain_text", "")
+                for item in (props.get("Include Keywords", {}).get("rich_text") or [])
+            ).split(",")
+            if part.strip()
+        ]
+        exclude_keywords = [
+            part.strip().casefold()
+            for part in "".join(
+                item.get("plain_text", "")
+                for item in (props.get("Exclude Keywords", {}).get("rich_text") or [])
+            ).split(",")
+            if part.strip()
+        ]
+        require_event_intent = bool((props.get("Require Event Intent", {}).get("checkbox")))
+        sources.append({
+            "id": page.get("id"),
+            "name": name,
+            "source_url": source_url,
+            "source_type": source_type,
+            "polling_frequency": polling_frequency,
+            "monitoring_enabled": monitoring_enabled,
+            "monitoring_status": monitoring_status,
+            "include_keywords": include_keywords,
+            "exclude_keywords": exclude_keywords,
+            "require_event_intent": require_event_intent,
+        })
+    return sources
+
+
+PUBLIC_SOURCE_TYPES = {"Website", "Luma", "Calendar", "Newsletter", "Other"}
+UNSUPPORTED_SOURCE_TYPES = {"Instagram", "TikTok", "LinkedIn", "YouTube"}
+MONITOR_SKIP_PATHS = {"about", "contact", "login", "privacy", "terms", "pricing", "faq"}
+MONITOR_EVENT_INTENT_KEYWORDS = [
+    "event", "events", "workshop", "workshops", "exhibition", "exhibitions",
+    "activation", "activations", "festival", "programming", "ticketed", "reserve",
+    "sign up", "admission", "opening", "talk", "panel", "class", "concert",
+]
+
+
+def scrape_monitor_source(source_url: str) -> tuple[str, list[str]]:
+    """Fetch a public source page and return bounded text plus page links."""
+    if not FIRECRAWL_API_KEY:
+        raise RuntimeError("FIRECRAWL_API_KEY is not configured")
+    response = requests.post(
+        f"{FIRECRAWL_API_URL.rstrip('/')}/v2/scrape",
+        headers={
+            "Authorization": f"Bearer {FIRECRAWL_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "url": source_url,
+            "formats": ["markdown", "links"],
+            "onlyMainContent": True,
+            "maxAge": 900000,
+        },
+        timeout=MONITOR_HTTP_TIMEOUT_S,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    data = payload.get("data") or {}
+    return str(data.get("markdown") or "")[:50000], [
+        link for link in (data.get("links") or []) if isinstance(link, str)
+    ]
+
+
+def monitor_candidate_matches(
+    candidate_url: str,
+    include_keywords: list[str],
+    exclude_keywords: list[str],
+    required_keywords: list[str] | None = None,
+) -> bool:
+    """Apply the configured source filter to a public candidate page."""
+    markdown, _links = scrape_monitor_source(candidate_url)
+    return matches_monitor_keywords(
+        f"{candidate_url}\n{markdown}", include_keywords, exclude_keywords, required_keywords
+    )
+
+
+def select_monitor_candidates(source_url: str, links: list[str]) -> list[str]:
+    """Select likely content pages without following arbitrary external links."""
+    source = urlparse(source_url)
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for link in links:
+        parsed = urlparse(link)
+        if parsed.scheme not in {"http", "https"} or parsed.netloc.lower() != source.netloc.lower():
+            continue
+        normalized = normalize_source_url(link)
+        if not normalized or normalized == normalize_source_url(source_url) or normalized in seen:
+            continue
+        path_parts = [part.casefold() for part in parsed.path.split("/") if part]
+        if not path_parts or path_parts[-1] in MONITOR_SKIP_PATHS:
+            continue
+        if any(part in MONITOR_SKIP_PATHS for part in path_parts):
+            continue
+        if any(parsed.path.casefold().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".pdf")):
+            continue
+        seen.add(normalized)
+        candidates.append(link)
+        if len(candidates) >= MONITOR_MAX_ITEMS_PER_SOURCE:
+            break
+    return candidates
+
+
+def explain_monitor_keywords(
+    text: str,
+    include_keywords: list[str],
+    exclude_keywords: list[str],
+    required_keywords: list[str] | None = None,
+) -> dict[str, Any]:
+    haystack = text.casefold()
+    def keyword_matches(keyword: str) -> bool:
+        normalized = keyword.strip().casefold()
+        if not normalized:
+            return False
+        pattern = rf"(?<!\w){re.escape(normalized)}(?!\w)"
+        return re.search(pattern, haystack) is not None
+
+    matched_excludes = [keyword for keyword in exclude_keywords if keyword_matches(keyword)]
+    matched_includes = [keyword for keyword in include_keywords if keyword_matches(keyword)]
+    matched_required = [keyword for keyword in (required_keywords or []) if keyword_matches(keyword)]
+    event_required = bool(required_keywords)
+    return {
+        "decision": (
+            "reject"
+            if matched_excludes
+            or (include_keywords and not matched_includes)
+            or (event_required and not matched_required)
+            else "pass"
+        ),
+        "matched_include_keywords": matched_includes,
+        "matched_exclude_keywords": matched_excludes,
+        "matched_required_keywords": matched_required,
+    }
+
+
+def matches_monitor_keywords(
+    text: str,
+    include_keywords: list[str],
+    exclude_keywords: list[str],
+    required_keywords: list[str] | None = None,
+) -> bool:
+    return explain_monitor_keywords(text, include_keywords, exclude_keywords, required_keywords)["decision"] == "pass"
+
+
+def poll_instagram_source(
+    source_url: str,
+    include_keywords: list[str] | None = None,
+    exclude_keywords: list[str] | None = None,
+    diagnostics: bool = False,
+    require_event_intent: bool = False,
+) -> list[str] | list[dict[str, Any]]:
+    """Return bounded post URLs from one Instagram profile via Apify."""
+    include_keywords = include_keywords or []
+    exclude_keywords = exclude_keywords or []
+    run = run_apify_actor(
+        APIFY_INSTAGRAM_ACTOR,
+        {"directUrls": [source_url], "resultsLimit": MONITOR_MAX_ITEMS_PER_SOURCE},
+    )
+    if run is None:
+        raise ValueError(f"Apify actor {APIFY_INSTAGRAM_ACTOR} run failed to start for {source_url}")
+    run_status = getattr(run, "status", None)
+    if run_status and run_status != "SUCCEEDED":
+        raise ValueError(
+            f"Apify actor {APIFY_INSTAGRAM_ACTOR} run did not succeed "
+            f"(status={run_status}): {getattr(run, 'status_message', None)}"
+        )
+    items = apify_client.dataset(run.default_dataset_id).iterate_items(
+        limit=MONITOR_MAX_ITEMS_PER_SOURCE,
+        timeout=timedelta(seconds=APIFY_HTTP_TIMEOUT_S),
+    )
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        post_url = item.get("url") or item.get("postUrl") or item.get("webUrl")
+        if not isinstance(post_url, str) or classify_url(post_url) != "instagram":
+            continue
+        parsed = urlparse(post_url)
+        if not any(part in parsed.path.split("/") for part in ("p", "reel", "tv")):
+            continue
+        searchable_text = " ".join(
+            str(item.get(field) or "")
+            for field in ("caption", "text", "alt", "title", "url")
+        )
+        explanation = explain_monitor_keywords(
+            searchable_text,
+            include_keywords,
+            exclude_keywords,
+            MONITOR_EVENT_INTENT_KEYWORDS if require_event_intent else None,
+        )
+        if diagnostics:
+            diagnostic = {
+                "url": post_url,
+                "decision": explanation["decision"],
+                "matched_include_keywords": explanation["matched_include_keywords"],
+                "matched_exclude_keywords": explanation["matched_exclude_keywords"],
+                "matched_required_keywords": explanation["matched_required_keywords"],
+                "text_preview": searchable_text[:1000],
+            }
+            candidates.append(diagnostic)
+            continue
+        if explanation["decision"] != "pass":
+            continue
+        normalized = normalize_source_url(post_url)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            candidates.append(post_url)
+        if not diagnostics and len(candidates) >= MONITOR_MAX_ITEMS_PER_SOURCE:
+            break
+    return candidates
+
+
+def run_monitoring(
+    *,
+    dry_run: bool = True,
+    diagnostics: bool = False,
+    source_urls: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """Poll eligible public sources; dry-run never writes Inbox pages."""
+    if not MONITOR_RUN_LOCK.acquire(blocking=False):
+        log.warning("Monitoring run skipped because another run is still in progress")
+        return {"dry_run": dry_run, "status": "busy", "source_count": 0, "results": []}
+
+    try:
+        sources = list_monitored_sources()
+        if source_urls:
+            wanted_sources = {normalize_source_url(url) for url in source_urls}
+            sources = [
+                source
+                for source in sources
+                if normalize_source_url(source.get("source_url")) in wanted_sources
+            ]
+        results: list[dict[str, Any]] = []
+        seen_external_ids: set[str] = set()
+        for source in sources:
+            source_type = source.get("source_type")
+            source_url = source.get("source_url")
+            result: dict[str, Any] = {"source": source, "status": "skipped", "candidates": []}
+            if source_type == "Instagram" and source_url:
+                try:
+                    candidates = poll_instagram_source(
+                        source_url,
+                        source.get("include_keywords") or [],
+                        source.get("exclude_keywords") or [],
+                        diagnostics=diagnostics and dry_run,
+                        require_event_intent=source.get("require_event_intent", False),
+                    )
+                    if diagnostics and dry_run:
+                        result["diagnostics"] = candidates
+                        result["candidates"] = [item["url"] for item in candidates]
+                    else:
+                        result["candidates"] = candidates
+                    result["status"] = "dry_run" if dry_run else "processed"
+                    if not dry_run:
+                        unique_candidates = []
+                        for url in candidates[:MONITOR_MAX_LIVE_ITEMS_PER_SOURCE]:
+                            external_id = normalize_source_url(url)
+                            if external_id and external_id in seen_external_ids:
+                                continue
+                            if external_id:
+                                seen_external_ids.add(external_id)
+                            unique_candidates.append(url)
+                        result["captures"] = [
+                            process_capture(
+                                url=url,
+                                discovery_source_url=source_url,
+                                external_id_override=normalize_source_url(url),
+                            )
+                            for url in unique_candidates
+                        ]
+                except Exception as e:
+                    log.exception("Instagram monitoring failed for %s", source_url)
+                    result["status"] = "error"
+                    result["reason"] = str(e)
+            elif source_type in UNSUPPORTED_SOURCE_TYPES:
+                result["reason"] = "source type adapter not implemented"
+            elif source_type not in PUBLIC_SOURCE_TYPES or not source_url:
+                result["reason"] = "missing URL or unsupported source type"
+            else:
+                try:
+                    _markdown, links = scrape_monitor_source(source_url)
+                    candidates = select_monitor_candidates(source_url, links)
+                    include_keywords = source.get("include_keywords") or []
+                    exclude_keywords = source.get("exclude_keywords") or []
+                    candidates = [
+                        url
+                        for url in candidates
+                        if monitor_candidate_matches(
+                            url,
+                            include_keywords,
+                            exclude_keywords,
+                            MONITOR_EVENT_INTENT_KEYWORDS if source.get("require_event_intent", False) else None,
+                        )
+                    ]
+                    result["candidates"] = candidates
+                    result["status"] = "dry_run" if dry_run else "processed"
+                    if not dry_run:
+                        unique_candidates = []
+                        for url in candidates[:MONITOR_MAX_LIVE_ITEMS_PER_SOURCE]:
+                            external_id = normalize_source_url(url)
+                            if external_id and external_id in seen_external_ids:
+                                continue
+                            if external_id:
+                                seen_external_ids.add(external_id)
+                            unique_candidates.append(url)
+                        result["captures"] = [
+                            process_capture(
+                                url=url,
+                                discovery_source_url=source_url,
+                                external_id_override=normalize_source_url(url),
+                            )
+                            for url in unique_candidates
+                        ]
+                except Exception as e:
+                    log.exception("Monitoring failed for %s", source_url)
+                    result["status"] = "error"
+                    result["reason"] = str(e)
+            results.append(result)
+        return {"dry_run": dry_run, "source_count": len(sources), "results": results}
+    finally:
+        MONITOR_RUN_LOCK.release()
+
+
+def find_exact_related_page(data_source_id: str, title_property: str, candidate: Any) -> Optional[str]:
+    """Return a page ID only for one exact normalized title match."""
+    if not isinstance(candidate, str) or not candidate.strip():
+        return None
+    candidate = candidate.strip()[:2000]
+    try:
+        results = notion.data_sources.query(
+            data_source_id=data_source_id,
+            filter={"property": title_property, "title": {"contains": candidate}},
+            page_size=100,
+        )
+    except Exception as e:
+        log.warning("Notion: relation lookup failed for %r (%s)", candidate, e)
+        return None
+
+    matches = []
+    wanted = normalize_entity_name(candidate)
+    for page in results.get("results") or []:
+        for prop in (page.get("properties") or {}).values():
+            if prop.get("type") != "title":
+                continue
+            title_parts = prop.get("title") or []
+            actual = "".join(part.get("plain_text", "") for part in title_parts)
+            if normalize_entity_name(actual) == wanted:
+                matches.append(page["id"])
+            break
+    return matches[0] if len(matches) == 1 else None
 
 
 def get_data_source_id() -> str:
@@ -624,7 +1182,94 @@ def get_data_source_id() -> str:
     return _data_source_id
 
 
-def find_existing_page(url: str) -> Optional[dict[str, Any]]:
+def get_database_properties() -> dict[str, Any]:
+    """Return the current database schema, cached for this process.
+
+    Expansion fields are optional until the Notion schema migration is applied.
+    This lets the deployed saver remain compatible during that transition.
+    """
+    global _database_properties
+    if _database_properties is None:
+        # With the current Notion API, configurable properties live on the
+        # data source rather than the parent database object.
+        db = notion.data_sources.retrieve(data_source_id=get_data_source_id())
+        _database_properties = db.get("properties") or {}
+    return _database_properties
+
+
+def add_optional_notion_properties(properties: dict[str, Any], ai_data: dict[str, Any]) -> None:
+    """Add expansion fields only when the corresponding Notion property exists.
+
+    Relations are deliberately excluded here: resolving a person/festival match
+    requires an explicit identity/deduplication policy and belongs to Phase 3.
+    """
+    try:
+        schema = get_database_properties()
+    except Exception as e:
+        log.warning("Notion: optional expansion schema unavailable; using core fields (%s)", e)
+        return
+    optional_values = {
+        "City": ("rich_text", ai_data.get("city")),
+        "Country": ("rich_text", ai_data.get("country")),
+        "Event Date": ("date", ai_data.get("event_date")),
+        "Event Start": ("date", ai_data.get("event_start") or ai_data.get("event_date")),
+        "Event End": ("date", ai_data.get("event_end")),
+        "Event Status": ("select", ai_data.get("event_status")),
+        "Relevance Score": ("number", ai_data.get("relevance_score")),
+        "Routing Status": ("select", ai_data.get("routing_status")),
+        "Routing Category": ("select", ai_data.get("routing_category")),
+        "Discovery Source": ("rich_text", ai_data.get("discovery_source")),
+        "Why It Matched": ("rich_text", ai_data.get("why_it_matched")),
+    }
+    for name, (property_type, value) in optional_values.items():
+        if name not in schema or value in (None, ""):
+            continue
+        if schema[name].get("type") != property_type:
+            log.warning("Notion: ignoring %s because its type is not %s", name, property_type)
+            continue
+        if property_type == "rich_text":
+            properties[name] = {"rich_text": [{"type": "text", "text": {"content": str(value)[:2000]}}]}
+        elif property_type == "select":
+            allowed = {option.get("name") for option in schema[name].get("select", {}).get("options", [])}
+            if allowed and str(value) not in allowed:
+                log.warning("Notion: ignoring %s value %r; option is not configured", name, value)
+                continue
+            properties[name] = {"select": {"name": str(value)}}
+        elif property_type == "date":
+            properties[name] = {"date": {"start": str(value)}}
+        elif property_type == "number":
+            try:
+                properties[name] = {"number": max(0, min(100, int(value)))}
+            except (TypeError, ValueError):
+                log.warning("Notion: ignoring non-numeric Relevance Score %r", value)
+
+
+def add_exact_relations(properties: dict[str, Any], ai_data: dict[str, Any]) -> None:
+    """Link only safe existing canonical records; never create or guess one.
+
+    Contacts stay manual-confirmation-only because an extracted organizer,
+    author, venue, or speaker is not necessarily a canonical contact. Festival
+    and Edition links require an explicit recurring-festival classification.
+    """
+    try:
+        schema = get_database_properties()
+        relation_targets = {}
+        if ai_data.get("is_recurring_festival") is True:
+            relation_targets = {
+                "Related Festival": (FESTIVALS_DATA_SOURCE_ID, "Festival", ai_data.get("related_festival_name")),
+                "Related Edition": (EDITIONS_DATA_SOURCE_ID, "Edition", ai_data.get("related_edition_name")),
+            }
+        for property_name, (data_source_id, title_property, candidate) in relation_targets.items():
+            if schema.get(property_name, {}).get("type") != "relation":
+                continue
+            page_id = find_exact_related_page(data_source_id, title_property, candidate)
+            if page_id:
+                properties[property_name] = {"relation": [{"id": page_id}]}
+    except Exception as e:
+        log.warning("Notion: relation matching unavailable; leaving relations empty (%s)", e)
+
+
+def find_existing_page(external_id: str) -> Optional[dict[str, Any]]:
     """Return {"id", "title"} for the page already saved for this URL, if any.
     Checked at the top of process_url (before any Apify/Gemini work) so a
     retried webhook call (e.g. a phone client re-sending after its own
@@ -632,7 +1277,7 @@ def find_existing_page(url: str) -> Optional[dict[str, Any]]:
     most expensive stages just to discover it's a duplicate at the very end."""
     results = notion.data_sources.query(
         data_source_id=get_data_source_id(),
-        filter={"property": "External ID", "rich_text": {"equals": url[:2000]}},
+        filter={"property": "External ID", "rich_text": {"equals": external_id[:2000]}},
         page_size=1,
     )
     pages = results.get("results") or []
@@ -640,17 +1285,30 @@ def find_existing_page(url: str) -> Optional[dict[str, Any]]:
         return None
     page = pages[0]
     title_parts = (page.get("properties", {}).get("Title", {}).get("title") or [])
-    title = title_parts[0]["plain_text"] if title_parts else url
+    title = title_parts[0]["plain_text"] if title_parts else external_id
     return {"id": page["id"], "title": title}
 
 
-def push_to_notion(url: str, platform: str, title: str, ai_data: dict[str, Any]) -> str:
+def stable_text_external_id(text: str, title: str = "") -> str:
+    """Build a deterministic dedup key for text-only captures."""
+    digest = hashlib.sha256(f"{title}\n{text}".encode("utf-8")).hexdigest()
+    return f"text:{digest}"
+
+
+def push_to_notion(
+    url: Optional[str],
+    platform: str,
+    title: str,
+    ai_data: dict[str, Any],
+    external_id: Optional[str] = None,
+    discovery_source_url: Optional[str] = None,
+) -> str:
     """Create a Notion page with mapped properties + transcription page content.
     Returns the new page ID. Callers are expected to have already checked
     find_existing_page — this always creates."""
     properties = {
         "Title": {"title": [{"text": {"content": title[:2000] or url}}]},
-        "URL": {"url": url},
+        "URL": {"url": url} if url else {"url": None},
         "Category": {"select": {"name": ai_data["category"]}},
         "Tags": {"multi_select": [{"name": tag} for tag in (ai_data.get("tags") or [])]},
         "AI Summary": {
@@ -668,8 +1326,35 @@ def push_to_notion(url: str, platform: str, title: str, ai_data: dict[str, Any])
         "Capture Tool": {"select": {"name": "Universal Web Saver"}},
         "Source Type": {"select": {"name": SOURCE_TYPE_MAP.get(platform, "Other")}},
         "Status": {"select": {"name": "New"}},
-        "External ID": {"rich_text": [{"type": "text", "text": {"content": url[:2000]}}]},
+        "External ID": {
+            "rich_text": [
+                {
+                    "type": "text",
+                    "text": {"content": (external_id or url or "")[:2000]},
+                }
+            ]
+        },
     }
+    source_page_id = find_monitored_source_page(discovery_source_url)
+    add_optional_notion_properties(properties, ai_data)
+    add_exact_relations(properties, ai_data)
+
+    if source_page_id:
+        try:
+            schema = get_database_properties()
+            if schema.get("Monitored Source", {}).get("type") == "relation":
+                properties["Monitored Source"] = {"relation": [{"id": source_page_id}]}
+        except Exception as e:
+            log.warning("Notion: could not map monitored source relation (%s)", e)
+    elif discovery_source_url:
+        try:
+            schema = get_database_properties()
+            routing_schema = schema.get("Routing Status", {})
+            allowed = {option.get("name") for option in routing_schema.get("select", {}).get("options", [])}
+            if routing_schema.get("type") == "select" and "To Sort" in allowed:
+                properties["Routing Status"] = {"select": {"name": "To Sort"}}
+        except Exception as e:
+            log.warning("Notion: could not mark unmatched source as To Sort (%s)", e)
 
     log.info("Notion: creating page '%s'", title[:80])
     page = notion.pages.create(
@@ -692,42 +1377,80 @@ def push_to_notion(url: str, platform: str, title: str, ai_data: dict[str, Any])
 # The async pipeline
 # --------------------------------------------------------------------------- #
 
-def process_url(url: str) -> dict[str, Any]:
+def process_capture(
+    *,
+    url: Optional[str] = None,
+    raw_text: Optional[str] = None,
+    title_hint: Optional[str] = None,
+    discovery_source_url: Optional[str] = None,
+    external_id_override: Optional[str] = None,
+) -> dict[str, Any]:
     """Full extraction -> Gemini -> Notion pipeline. Each stage's exception is
     caught and logged, then turned into a real {"ok": False, "error": ...}
     result instead of being swallowed, so the caller can report what actually
     happened."""
-    log.info("=== Processing %s ===", url)
+    if not url and not raw_text:
+        return {"ok": False, "error": "A capture must include 'url' or non-empty 'text'"}
+
+    title_hint = (title_hint or "").strip()
+    external_id = external_id_override or url or stable_text_external_id(raw_text or "", title_hint)
+    source_for_ai = url or "text://capture"
+    log.info("=== Processing %s ===", source_for_ai)
 
     try:
-        existing = find_existing_page(url)
+        existing = find_existing_page(external_id)
     except Exception:
-        log.exception("Dedup check failed for %s, proceeding as new save", url)
+        log.exception("Dedup check failed for %s, proceeding as new save", source_for_ai)
         existing = None
     if existing:
-        log.info("Notion: %s already saved as page %s, skipping re-extraction", url, existing["id"])
+        log.info("Notion: %s already saved as page %s, skipping re-extraction", source_for_ai, existing["id"])
         return {"ok": True, "title": existing["title"], "notion_page_id": existing["id"]}
 
-    try:
-        platform, extracted = route_and_extract(url)
-    except Exception as e:
-        log.exception("Extraction failed for %s", url)
-        return {"ok": False, "error": f"Extraction failed: {e}"}
+    if raw_text is not None:
+        platform = "general"
+        extracted = {
+            "text": raw_text.strip(),
+            "title": title_hint or "Text capture",
+            "author_name": None,
+            "images": [],
+        }
+    else:
+        try:
+            platform, extracted = route_and_extract(url or "")
+        except Exception as e:
+            log.exception("Extraction failed for %s", source_for_ai)
+            return {"ok": False, "error": f"Extraction failed: {e}"}
 
     try:
-        ai_data = call_gemini(url, extracted)
+        ai_data = call_gemini(source_for_ai, extracted)
     except Exception as e:
-        log.exception("Gemini tagging failed for %s", url)
+        log.exception("Gemini tagging failed for %s", source_for_ai)
         return {"ok": False, "error": f"Gemini tagging failed: {e}"}
 
     try:
-        page_id = push_to_notion(url, platform, extracted.get("title") or url, ai_data)
+        page_id = push_to_notion(
+            url,
+            platform,
+            extracted.get("title") or title_hint or url or "Text capture",
+            ai_data,
+            external_id=external_id,
+            discovery_source_url=discovery_source_url,
+        )
     except Exception as e:
-        log.exception("Notion push failed for %s", url)
+        log.exception("Notion push failed for %s", source_for_ai)
         return {"ok": False, "error": f"Notion push failed: {e}"}
 
-    log.info("=== Done: %s ===", url)
-    return {"ok": True, "title": extracted.get("title") or url, "notion_page_id": page_id}
+    log.info("=== Done: %s ===", source_for_ai)
+    return {
+        "ok": True,
+        "title": extracted.get("title") or title_hint or url or "Text capture",
+        "notion_page_id": page_id,
+    }
+
+
+def process_url(url: str) -> dict[str, Any]:
+    """Backward-compatible URL entry point."""
+    return process_capture(url=url)
 
 
 # --------------------------------------------------------------------------- #
@@ -749,13 +1472,20 @@ async def webhook(
         raise HTTPException(status_code=400, detail="Body must be valid JSON")
 
     url = payload.get("url")
-    if not url:
-        raise HTTPException(status_code=400, detail="Missing 'url' field in payload")
+    raw_text = payload.get("text")
+    if not url and not raw_text:
+        raise HTTPException(status_code=400, detail="Missing 'url' or non-empty 'text' field in payload")
 
-    log.info("Accepted webhook for %s", url)
+    log.info("Accepted webhook capture (%s)", "url" if url else "text")
     # process_url does blocking I/O (requests/apify_client/notion_client are all
     # sync); offload to a threadpool so the event loop can still serve /health etc.
-    result = await run_in_threadpool(process_url, url)
+    result = await run_in_threadpool(
+        process_capture,
+        url=url,
+        raw_text=raw_text,
+        title_hint=payload.get("title"),
+        discovery_source_url=payload.get("discovery_source_url"),
+    )
     if not result["ok"]:
         raise HTTPException(status_code=502, detail=result["error"])
     return {"status": "saved", "title": result["title"], "notion_page_id": result["notion_page_id"]}
@@ -764,3 +1494,58 @@ async def webhook(
 @app.get("/health")
 async def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
+
+
+@app.get("/monitor/status")
+async def monitor_status(x_api_key: Optional[str] = Header(default=None)):
+    """Return the opt-in source set for a future scheduler/monitor worker.
+
+    This endpoint intentionally performs no scraping and creates no Notion
+    records. It is useful for deployment verification and for a scheduler to
+    confirm that the existing Contacts registry is configured as expected.
+    """
+    if not x_api_key or not hmac.compare_digest(x_api_key, SECRET_WEBHOOK_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
+    try:
+        sources = await run_in_threadpool(list_monitored_sources)
+    except Exception as e:
+        log.exception("Monitoring source registry lookup failed")
+        raise HTTPException(status_code=502, detail=f"Monitoring source lookup failed: {e}")
+    return {
+        "status": "ready",
+        "scraping_started": False,
+        "source_count": len(sources),
+        "sources": sources,
+        "max_sources_per_run": MONITOR_MAX_SOURCES,
+    }
+
+
+@app.post("/monitor/run")
+async def monitor_run(
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """Run the bounded public-source poller; writes require explicit dry_run=false."""
+    if not x_api_key or not hmac.compare_digest(x_api_key, SECRET_WEBHOOK_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    dry_run = payload.get("dry_run", True) is not False
+    diagnostics = payload.get("diagnostics", False) is True
+    source_urls = payload.get("source_urls")
+    if not isinstance(source_urls, list) or not all(isinstance(url, str) for url in source_urls):
+        source_urls = None
+    try:
+        return await run_in_threadpool(
+            run_monitoring,
+            dry_run=dry_run,
+            diagnostics=diagnostics,
+            source_urls=source_urls,
+        )
+    except Exception as e:
+        log.exception("Monitoring run failed")
+        raise HTTPException(status_code=502, detail=f"Monitoring run failed: {e}")
