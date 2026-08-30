@@ -960,6 +960,11 @@ def matches_monitor_keywords(
     return explain_monitor_keywords(text, include_keywords, exclude_keywords, required_keywords)["decision"] == "pass"
 
 
+def should_skip_monitored_event(ai_data: dict[str, Any]) -> bool:
+    """Keep historical event pages out of the live event-saver inbox."""
+    return str(ai_data.get("event_status") or "").strip().casefold() == "past"
+
+
 def poll_instagram_source(
     source_url: str,
     include_keywords: list[str] | None = None,
@@ -1082,6 +1087,7 @@ def run_monitoring(
                                 url=url,
                                 discovery_source_url=source_url,
                                 external_id_override=normalize_source_url(url),
+                                skip_past_events=True,
                             )
                             for url in unique_candidates
                         ]
@@ -1125,6 +1131,7 @@ def run_monitoring(
                                 url=url,
                                 discovery_source_url=source_url,
                                 external_id_override=normalize_source_url(url),
+                                skip_past_events=True,
                             )
                             for url in unique_candidates
                         ]
@@ -1384,6 +1391,7 @@ def process_capture(
     title_hint: Optional[str] = None,
     discovery_source_url: Optional[str] = None,
     external_id_override: Optional[str] = None,
+    skip_past_events: bool = False,
 ) -> dict[str, Any]:
     """Full extraction -> Gemini -> Notion pipeline. Each stage's exception is
     caught and logged, then turned into a real {"ok": False, "error": ...}
@@ -1426,6 +1434,14 @@ def process_capture(
     except Exception as e:
         log.exception("Gemini tagging failed for %s", source_for_ai)
         return {"ok": False, "error": f"Gemini tagging failed: {e}"}
+
+    if skip_past_events and should_skip_monitored_event(ai_data):
+        log.info("Skipping past event capture for %s", source_for_ai)
+        return {
+            "ok": True,
+            "status": "skipped_past_event",
+            "title": extracted.get("title") or title_hint or url or "Text capture",
+        }
 
     try:
         page_id = push_to_notion(
