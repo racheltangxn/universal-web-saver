@@ -26,13 +26,15 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 import trafilatura
@@ -116,7 +118,7 @@ app = FastAPI(title="Universal Web Saver")
 # --------------------------------------------------------------------------- #
 
 def classify_url(url: str) -> str:
-    """Return one of: instagram, tiktok, linkedin, youtube, general."""
+    """Return the supported source platform for a URL."""
     host = urlparse(url).netloc.lower()
 
     if "instagram.com" in host:
@@ -127,6 +129,8 @@ def classify_url(url: str) -> str:
         return "linkedin"
     if "youtube.com" in host or "youtu.be" in host:
         return "youtube"
+    if "meetup.com" in host:
+        return "meetup"
     return "general"
 
 
@@ -717,6 +721,9 @@ SOURCE_TYPE_MAP = {
     "tiktok": "TikTok",
     "linkedin": "LinkedIn",
     "youtube": "YouTube",
+    # The current Inbox schema has no Meetup option; retain these as Other
+    # while Routing Category=Events identifies the intended destination.
+    "meetup": "Other",
     "general": "Web Article",
 }
 
@@ -738,6 +745,14 @@ def normalize_source_url(value: Optional[str]) -> str:
     host = parsed.netloc.lower().removeprefix("www.")
     path = parsed.path.rstrip("/") or "/"
     return f"{scheme}://{host}{path}"
+
+
+def meetup_event_external_id(url: Optional[str]) -> Optional[str]:
+    """Return a stable ID for Meetup event URLs, independent of tracking params."""
+    if not isinstance(url, str):
+        return None
+    match = re.search(r"meetup\.com/[^/]+/events/(\d+)", url.casefold())
+    return f"meetup:{match.group(1)}" if match else None
 
 
 def find_monitored_source_page(source_url: Optional[str]) -> Optional[str]:
@@ -857,7 +872,58 @@ MONITOR_EVENT_INTENT_KEYWORDS = [
 def scrape_monitor_source(source_url: str) -> tuple[str, list[str]]:
     """Fetch a public source page and return bounded text plus page links."""
     if not FIRECRAWL_API_KEY:
-        raise RuntimeError("FIRECRAWL_API_KEY is not configured")
+        # The authenticated Firecrawl CLI works in environments where direct
+        # outbound DNS/HTTPS is unavailable (notably launchd on this Mac).
+        # Prefer it before the direct HTTP fallback.
+        firecrawl_cli = os.environ.get("FIRECRAWL_CLI") or shutil.which("firecrawl")
+        if not firecrawl_cli:
+            candidate = "/Users/racheltang/.npm-global/bin/firecrawl"
+            if os.path.exists(candidate):
+                firecrawl_cli = candidate
+        if firecrawl_cli:
+            try:
+                result = subprocess.run(
+                    [firecrawl_cli, "scrape", source_url,
+                     "--format", "markdown,links", "--json", "--no-save-changes"],
+                    capture_output=True,
+                    text=True,
+                    env={
+                        **os.environ,
+                        "HOME": "/Users/racheltang",
+                        "PATH": "/usr/local/bin:/Users/racheltang/.npm-global/bin:" + os.environ.get("PATH", ""),
+                    },
+                    timeout=MONITOR_HTTP_TIMEOUT_S + 30,
+                    check=True,
+                )
+                payload_text = result.stdout[result.stdout.find("{"):]
+                payload = json.loads(payload_text)
+                data = payload.get("data") or payload
+                markdown = str(data.get("markdown") or "")[:50000]
+                links = [link for link in (data.get("links") or []) if isinstance(link, str)]
+                if markdown or links:
+                    return markdown, links
+            except subprocess.CalledProcessError as e:
+                detail = (e.stderr or e.stdout or "").strip().replace("\n", " ")[:500]
+                log.warning("Firecrawl CLI failed for %s (exit %s): %s", source_url, e.returncode, detail or e)
+                if classify_url(source_url) == "meetup":
+                    raise RuntimeError(f"Firecrawl CLI unavailable for Meetup: {detail or e}") from e
+            except Exception as e:
+                log.warning("Firecrawl CLI failed for %s (%s)", source_url, e)
+                if classify_url(source_url) == "meetup":
+                    raise RuntimeError(f"Firecrawl CLI unavailable for Meetup: {e}") from e
+
+        # Direct fallback for environments where requests can reach the site.
+        response = requests.get(
+            source_url,
+            headers={"User-Agent": "Mozilla/5.0 (Universal Web Saver monitor)"},
+            timeout=MONITOR_HTTP_TIMEOUT_S,
+        )
+        response.raise_for_status()
+        html = response.text[:500000]
+        markdown = trafilatura.extract(html) or re.sub(r"<[^>]+>", " ", html)
+        raw_links = re.findall(r'''href=["']([^"']+)["']''', html, flags=re.IGNORECASE)
+        links = [urljoin(source_url, link) for link in raw_links]
+        return str(markdown)[:50000], links
     response = requests.post(
         f"{FIRECRAWL_API_URL.rstrip('/')}/v2/scrape",
         headers={
@@ -910,6 +976,11 @@ def select_monitor_candidates(source_url: str, links: list[str]) -> list[str]:
             continue
         if any(part in MONITOR_SKIP_PATHS for part in path_parts):
             continue
+        if classify_url(source_url) == "meetup":
+            if "events" not in path_parts or not path_parts[-1].isdigit():
+                continue
+            if "group_past_events" in parsed.query.casefold() or "past" in parsed.query.casefold():
+                continue
         if any(parsed.path.casefold().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".pdf")):
             continue
         seen.add(normalized)
@@ -1076,7 +1147,7 @@ def run_monitoring(
                     if not dry_run:
                         unique_candidates = []
                         for url in candidates[:MONITOR_MAX_LIVE_ITEMS_PER_SOURCE]:
-                            external_id = normalize_source_url(url)
+                            external_id = meetup_event_external_id(url) or normalize_source_url(url)
                             if external_id and external_id in seen_external_ids:
                                 continue
                             if external_id:
@@ -1086,7 +1157,7 @@ def run_monitoring(
                             process_capture(
                                 url=url,
                                 discovery_source_url=source_url,
-                                external_id_override=normalize_source_url(url),
+                                external_id_override=external_id,
                                 skip_past_events=True,
                             )
                             for url in unique_candidates
@@ -1120,7 +1191,7 @@ def run_monitoring(
                     if not dry_run:
                         unique_candidates = []
                         for url in candidates[:MONITOR_MAX_LIVE_ITEMS_PER_SOURCE]:
-                            external_id = normalize_source_url(url)
+                            external_id = meetup_event_external_id(url) or normalize_source_url(url)
                             if external_id and external_id in seen_external_ids:
                                 continue
                             if external_id:
@@ -1130,7 +1201,7 @@ def run_monitoring(
                             process_capture(
                                 url=url,
                                 discovery_source_url=source_url,
-                                external_id_override=normalize_source_url(url),
+                                external_id_override=external_id,
                                 skip_past_events=True,
                             )
                             for url in unique_candidates
@@ -1290,7 +1361,22 @@ def find_existing_page(external_id: str) -> Optional[dict[str, Any]]:
     pages = results.get("results") or []
     if not pages:
         return None
-    page = pages[0]
+    # Notion's rich_text equality filter can be permissive across API versions.
+    # Validate the returned value before using its page ID, otherwise two
+    # different Meetup event IDs could overwrite the same page.
+    exact_pages = []
+    for page in pages:
+        external_parts = (page.get("properties", {}).get("External ID", {}).get("rich_text") or [])
+        stored_external_id = "".join(part.get("plain_text", "") for part in external_parts)
+        if stored_external_id == external_id[:2000]:
+            exact_pages.append(page)
+    if len(exact_pages) != 1:
+        if exact_pages:
+            log.warning("Notion: found %d duplicate exact External ID records for %s", len(exact_pages), external_id)
+        else:
+            log.warning("Notion: rejected non-exact External ID lookup for %s", external_id)
+        return None
+    page = exact_pages[0]
     title_parts = (page.get("properties", {}).get("Title", {}).get("title") or [])
     title = title_parts[0]["plain_text"] if title_parts else external_id
     return {"id": page["id"], "title": title}
@@ -1309,10 +1395,9 @@ def push_to_notion(
     ai_data: dict[str, Any],
     external_id: Optional[str] = None,
     discovery_source_url: Optional[str] = None,
+    existing_page_id: Optional[str] = None,
 ) -> str:
-    """Create a Notion page with mapped properties + transcription page content.
-    Returns the new page ID. Callers are expected to have already checked
-    find_existing_page — this always creates."""
+    """Create or update a Notion page with mapped properties."""
     properties = {
         "Title": {"title": [{"text": {"content": title[:2000] or url}}]},
         "URL": {"url": url} if url else {"url": None},
@@ -1363,6 +1448,14 @@ def push_to_notion(
         except Exception as e:
             log.warning("Notion: could not mark unmatched source as To Sort (%s)", e)
 
+    if existing_page_id:
+        # Preserve human workflow state and original capture date on updates.
+        properties.pop("Status", None)
+        properties.pop("Date Posted", None)
+        notion.pages.update(page_id=existing_page_id, properties=properties)
+        log.info("Notion: updated page '%s' (%s)", title[:80], existing_page_id)
+        return existing_page_id
+
     log.info("Notion: creating page '%s'", title[:80])
     page = notion.pages.create(
         parent={"database_id": NOTION_DATABASE_ID},
@@ -1401,7 +1494,12 @@ def process_capture(
         return {"ok": False, "error": "A capture must include 'url' or non-empty 'text'"}
 
     title_hint = (title_hint or "").strip()
-    external_id = external_id_override or url or stable_text_external_id(raw_text or "", title_hint)
+    external_id = (
+        external_id_override
+        or meetup_event_external_id(url)
+        or url
+        or stable_text_external_id(raw_text or "", title_hint)
+    )
     source_for_ai = url or "text://capture"
     log.info("=== Processing %s ===", source_for_ai)
 
@@ -1410,7 +1508,8 @@ def process_capture(
     except Exception:
         log.exception("Dedup check failed for %s, proceeding as new save", source_for_ai)
         existing = None
-    if existing:
+    is_meetup_event = bool(meetup_event_external_id(url))
+    if existing and not is_meetup_event:
         log.info("Notion: %s already saved as page %s, skipping re-extraction", source_for_ai, existing["id"])
         return {"ok": True, "title": existing["title"], "notion_page_id": existing["id"]}
 
@@ -1435,7 +1534,7 @@ def process_capture(
         log.exception("Gemini tagging failed for %s", source_for_ai)
         return {"ok": False, "error": f"Gemini tagging failed: {e}"}
 
-    if skip_past_events and should_skip_monitored_event(ai_data):
+    if skip_past_events and not existing and should_skip_monitored_event(ai_data):
         log.info("Skipping past event capture for %s", source_for_ai)
         return {
             "ok": True,
@@ -1451,6 +1550,7 @@ def process_capture(
             ai_data,
             external_id=external_id,
             discovery_source_url=discovery_source_url,
+            existing_page_id=existing["id"] if existing else None,
         )
     except Exception as e:
         log.exception("Notion push failed for %s", source_for_ai)
